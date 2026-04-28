@@ -151,14 +151,14 @@ Return ONLY valid JSON (no markdown):
 // ── /api/process ──────────────────────────────────────────────────────────────
 
 app.post('/api/process', async (req, res) => {
-  const { url, cuts, muteWords = [], vodTitle = 'output' } = req.body
+  const { url, cuts, muteWords = [], vodTitle = 'output', twitchToken } = req.body
   if (!url || !cuts) return res.status(400).json({ error: 'Missing url or cuts' })
 
   const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2,7)}`
   setJob(jobId, { status: 'queued', progress: 0, phase: 'Starting...', vodTitle })
   res.json({ jobId })
 
-  processVideo(jobId, url, cuts, muteWords, vodTitle).catch(e => {
+  processVideo(jobId, url, cuts, muteWords, vodTitle, twitchToken).catch(e => {
     console.error(`[${jobId}] Fatal:`, e.message)
     setJob(jobId, { status: 'error', error: e.message })
   })
@@ -219,7 +219,7 @@ app.get('/health', (_, res) => res.json({ ok: true, jobs: jobs.size }))
 
 // ── Core processing ───────────────────────────────────────────────────────────
 
-async function processVideo(jobId, url, cuts, muteWords, vodTitle) {
+async function processVideo(jobId, url, cuts, muteWords, vodTitle, twitchToken) {
   const tmpDir = path.join(os.tmpdir(), jobId)
   await fsp.mkdir(tmpDir, { recursive: true })
 
@@ -228,12 +228,20 @@ async function processVideo(jobId, url, cuts, muteWords, vodTitle) {
 
     const inputPath = path.join(tmpDir, 'input.mp4')
     await new Promise((resolve, reject) => {
+      // Use passed user token first, fall back to env var
+      const token = twitchToken || process.env.TWITCH_AUTH_TOKEN
+      const authArgs = token ? [
+        '--add-header', `Authorization:OAuth ${token}`,
+        '--add-header', 'Client-ID:kimne78kx3ncx6brgo4mv6wki5h1ko',
+      ] : []
+
       const args = [
         url,
         '--no-playlist', '--retries', '3', '--fragment-retries', '3',
         '--file-access-retries', '3', '--no-check-certificates',
         '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
         '--merge-output-format', 'mp4', '-o', inputPath, '--newline', '--progress',
+        ...authArgs,
       ]
       const proc = spawn('yt-dlp', args, { cwd: tmpDir })
       proc.stdout.on('data', d => {
@@ -244,7 +252,7 @@ async function processVideo(jobId, url, cuts, muteWords, vodTitle) {
         if (pct) setJob(jobId, { progress: 2 + Math.min(38, Math.round(parseFloat(pct[1]) * 0.38)), phase: `Downloading: ${Math.round(parseFloat(pct[1]))}%` })
       })
       proc.stderr.on('data', d => console.error(`[${jobId}][yt-dlp err] ${d.toString().trim()}`))
-      proc.on('close', code => code === 0 ? resolve() : reject(new Error(`yt-dlp failed (code ${code}). VOD may be subscriber-only.`)))
+      proc.on('close', code => code === 0 ? resolve() : reject(new Error(`yt-dlp failed (code ${code}). Make sure TWITCH_AUTH_TOKEN is set in Railway env vars. Get it from Twitch cookies (auth-token).`)))
       proc.on('error', e => reject(new Error(`yt-dlp not found: ${e.message}`)))
     })
 
