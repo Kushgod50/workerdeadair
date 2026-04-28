@@ -1,0 +1,17 @@
+{
+  "name": "vodtrim-worker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0",
+    "cors": "^2.8.5",
+    "@anthropic-ai/sdk": "^0.20.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "ytdl-core": "^4.11.5"
+  }
+}
