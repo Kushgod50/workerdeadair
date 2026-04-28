@@ -11,34 +11,42 @@ const Anthropic = require('@anthropic-ai/sdk')
 const execAsync = promisify(exec)
 const app = express()
 const PORT = process.env.PORT || 3001
-
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
-app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || '*',
-  methods: ['GET', 'POST'],
-}))
-app.use(express.json())
+app.use(cors({ origin: '*', methods: ['GET', 'POST'] }))
+app.use(express.json({ limit: '10mb' }))
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function toTC(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60)
   return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
 }
 
-function log(jobId, msg) {
-  console.log(`[${jobId}] ${msg}`)
-}
+function log(jobId, msg) { console.log(`[${jobId || 'server'}] ${msg}`) }
 
-// In-memory job store
+// ── Job store ─────────────────────────────────────────────────────────────────
+
 const jobs = new Map()
 
 function setJob(id, data) {
-  jobs.set(id, { ...jobs.get(id), ...data, updatedAt: Date.now() })
+  jobs.set(id, { ...(jobs.get(id) || {}), ...data, updatedAt: Date.now() })
 }
 
-// ── /api/analyze — Claude analysis only, fast ─────────────────────────────
+function getJob(id) { return jobs.get(id) }
+
+// Clean up old jobs after 2 hours
+setInterval(() => {
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000
+  for (const [id, job] of jobs.entries()) {
+    if (job.updatedAt < cutoff) {
+      if (job.outputPath) fsp.unlink(job.outputPath).catch(() => {})
+      jobs.delete(id)
+    }
+  }
+}, 30 * 60 * 1000)
+
+// ── Claude analysis ───────────────────────────────────────────────────────────
 
 const GUIDES = {
   conservative: 'Only cut silences longer than 45 seconds and clear AFK moments.',
@@ -90,7 +98,6 @@ Return ONLY valid JSON (no markdown):
     const raw = resp.content[0].type === 'text' ? resp.content[0].text : ''
     const parsed = JSON.parse(raw.replace(/```json\n?/g,'').replace(/```\n?/g,'').trim())
     parsed.cuts.sort((a, b) => a.startSeconds - b.startSeconds)
-
     return res.json({ vodId, ...parsed, muteWords: parsed.muteWords || [] })
   } catch (e) {
     console.error(e)
@@ -98,100 +105,195 @@ Return ONLY valid JSON (no markdown):
   }
 })
 
-// ── /api/process — download + trim + mute, returns job ID ────────────────
+// ── Start processing job ──────────────────────────────────────────────────────
 
 app.post('/api/process', async (req, res) => {
   const { url, cuts, muteWords = [], vodTitle = 'output' } = req.body
   if (!url || !cuts) return res.status(400).json({ error: 'Missing url or cuts' })
 
   const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2,7)}`
-  setJob(jobId, { status: 'queued', progress: 0, phase: 'Queued', vodTitle })
+  setJob(jobId, { status: 'queued', progress: 0, phase: 'Starting...', vodTitle })
   res.json({ jobId })
 
-  // Run async
   processVideo(jobId, url, cuts, muteWords, vodTitle).catch(e => {
-    console.error(`[${jobId}] Fatal:`, e)
+    console.error(`[${jobId}] Fatal:`, e.message)
     setJob(jobId, { status: 'error', error: e.message })
   })
 })
 
-// ── /api/status/:jobId ────────────────────────────────────────────────────
+// ── Poll status ───────────────────────────────────────────────────────────────
 
 app.get('/api/status/:jobId', (req, res) => {
-  const job = jobs.get(req.params.jobId)
+  const job = getJob(req.params.jobId)
   if (!job) return res.status(404).json({ error: 'Job not found' })
-  res.json(job)
+  // Don't send the file path to the client
+  const { outputPath, ...safe } = job
+  res.json(safe)
 })
 
-// ── /api/download/:jobId ─────────────────────────────────────────────────
+// ── Download ──────────────────────────────────────────────────────────────────
 
 app.get('/api/download/:jobId', (req, res) => {
-  const job = jobs.get(req.params.jobId)
+  const job = getJob(req.params.jobId)
   if (!job || job.status !== 'done') return res.status(404).json({ error: 'Not ready' })
-  if (!fs.existsSync(job.outputPath)) return res.status(404).json({ error: 'File not found' })
+  if (!job.outputPath || !fs.existsSync(job.outputPath)) return res.status(404).json({ error: 'File missing' })
 
-  const filename = `${job.vodTitle.replace(/[^a-z0-9]/gi,'_').toLowerCase()}_trimmed.mp4`
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
-  res.setHeader('Content-Type', 'video/mp4')
+  const filename = `${(job.vodTitle || 'vod').replace(/[^a-z0-9]/gi,'_').toLowerCase()}_trimmed.mp4`
+  const fileSize = fs.statSync(job.outputPath).size
+  log(job.vodTitle, `Serving ${(fileSize/1024/1024).toFixed(1)}MB`)
 
-  const stream = fs.createReadStream(job.outputPath)
-  stream.pipe(res)
-  stream.on('end', () => {
-    // Clean up file after download
-    fsp.unlink(job.outputPath).catch(() => {})
-    fsp.rmdir(path.dirname(job.outputPath)).catch(() => {})
-  })
+  // Support range requests so browser can resume if connection drops
+  const range = req.headers.range
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-')
+    const start = parseInt(parts[0], 10)
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1
+    const chunkSize = end - start + 1
+    res.status(206)
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`)
+    res.setHeader('Content-Length', chunkSize)
+    res.setHeader('Accept-Ranges', 'bytes')
+    res.setHeader('Content-Type', 'video/mp4')
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
+    const stream = fs.createReadStream(job.outputPath, { start, end })
+    stream.pipe(res)
+    stream.on('error', e => { console.error('Range stream error:', e.message); res.end() })
+  } else {
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
+    res.setHeader('Content-Type', 'video/mp4')
+    res.setHeader('Content-Length', fileSize)
+    res.setHeader('Accept-Ranges', 'bytes')
+    const stream = fs.createReadStream(job.outputPath)
+    stream.pipe(res)
+    stream.on('error', e => { console.error('Stream error:', e.message); res.end() })
+    stream.on('close', () => {
+      // Delay cleanup 30s to ensure browser received everything
+      setTimeout(() => {
+        fsp.unlink(job.outputPath).catch(() => {})
+        fsp.rm(path.dirname(job.outputPath), { recursive: true, force: true }).catch(() => {})
+      }, 30000)
+    })
+  }
 })
 
-// ── Core processing function ──────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────────────────
+
+app.get('/health', (_, res) => res.json({ ok: true, jobs: jobs.size }))
+
+// ── Core processing ───────────────────────────────────────────────────────────
 
 async function processVideo(jobId, url, cuts, muteWords, vodTitle) {
   const tmpDir = path.join(os.tmpdir(), jobId)
   await fsp.mkdir(tmpDir, { recursive: true })
+  log(jobId, `Working in ${tmpDir}`)
 
   try {
-    // Step 1: Download VOD with yt-dlp
-    log(jobId, 'Downloading VOD...')
-    setJob(jobId, { status: 'downloading', phase: 'Downloading VOD', progress: 5 })
+    // ── Step 1: Download with yt-dlp ─────────────────────────────────────────
+    setJob(jobId, { status: 'downloading', phase: 'Downloading VOD from Twitch', progress: 2 })
+    log(jobId, 'Starting download...')
 
     const inputPath = path.join(tmpDir, 'input.mp4')
-    await downloadWithYtDlp(url, inputPath, (percent) => {
-      setJob(jobId, { progress: Math.round(5 + percent * 0.4), phase: `Downloading: ${percent}%` })
+
+    await new Promise((resolve, reject) => {
+      // Use cookies-from-browser or just best available format
+      // --no-check-certificate helps with some proxy issues
+      // --retries 3 retries on transient failures  
+      const args = [
+        url,
+        '--no-playlist',
+        '--retries', '3',
+        '--fragment-retries', '3',
+        '--file-access-retries', '3',
+        '--no-check-certificates',
+        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+        '--merge-output-format', 'mp4',
+        '-o', inputPath,
+        '--newline',
+        '--progress',
+      ]
+
+      log(jobId, `yt-dlp ${args.join(' ')}`)
+      const proc = spawn('yt-dlp', args, { cwd: tmpDir })
+
+      proc.stdout.on('data', (data) => {
+        const line = data.toString().trim()
+        if (!line) return
+        console.log(`[${jobId}][yt-dlp] ${line}`)
+
+        // Parse download percentage
+        const pct = line.match(/(\d+\.?\d*)%/)
+        if (pct) {
+          const p = Math.min(38, Math.round(parseFloat(pct[1]) * 0.38))
+          setJob(jobId, { progress: 2 + p, phase: `Downloading: ${Math.round(parseFloat(pct[1]))}%` })
+        }
+      })
+
+      proc.stderr.on('data', (data) => {
+        const line = data.toString().trim()
+        if (line) console.error(`[${jobId}][yt-dlp stderr] ${line}`)
+      })
+
+      proc.on('close', (code) => {
+        if (code === 0) {
+          log(jobId, 'yt-dlp finished successfully')
+          resolve()
+        } else {
+          reject(new Error(`yt-dlp failed with exit code ${code}. The VOD may be subscriber-only or unavailable.`))
+        }
+      })
+
+      proc.on('error', (e) => reject(new Error(`yt-dlp not found: ${e.message}. Make sure yt-dlp is installed.`)))
     })
-    log(jobId, 'Download complete')
 
-    // Step 2: Extract keep segments
-    log(jobId, 'Extracting segments...')
-    setJob(jobId, { status: 'trimming', phase: 'Cutting dead segments', progress: 45 })
+    // Verify file exists
+    if (!fs.existsSync(inputPath)) {
+      throw new Error('Download completed but output file not found')
+    }
+    const inputSize = fs.statSync(inputPath).size
+    log(jobId, `Downloaded: ${(inputSize / 1024 / 1024).toFixed(1)} MB`)
 
+    // ── Step 2: Get video duration ────────────────────────────────────────────
+    const { stdout: durOut } = await execAsync(
+      `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`
+    )
+    const totalSeconds = parseFloat(durOut.trim())
+    log(jobId, `Video duration: ${toTC(totalSeconds)}`)
+
+    // ── Step 3: Build keep list ───────────────────────────────────────────────
     const sortedCuts = [...cuts].sort((a, b) => a.startSeconds - b.startSeconds)
     const keepSegments = []
     let cursor = 0
-    const totalSeconds = await getVideoDuration(inputPath)
 
     for (const cut of sortedCuts) {
-      if (cut.startSeconds > cursor + 1) keepSegments.push({ start: cursor, end: cut.startSeconds })
+      if (cut.startSeconds > cursor + 1) {
+        keepSegments.push({ start: cursor, end: Math.min(cut.startSeconds, totalSeconds) })
+      }
       cursor = cut.endSeconds
     }
     if (cursor < totalSeconds - 1) keepSegments.push({ start: cursor, end: totalSeconds })
+
+    if (keepSegments.length === 0) throw new Error('No segments to keep after applying cuts')
+    log(jobId, `Keeping ${keepSegments.length} segments`)
+
+    // ── Step 4: Extract segments ──────────────────────────────────────────────
+    setJob(jobId, { status: 'trimming', phase: 'Cutting dead segments', progress: 42 })
 
     const segsDir = path.join(tmpDir, 'segs')
     await fsp.mkdir(segsDir, { recursive: true })
 
     for (let i = 0; i < keepSegments.length; i++) {
       const seg = keepSegments[i]
-      const outPath = path.join(segsDir, `${String(i).padStart(4,'0')}.ts`)
-      await execAsync(
-        `ffmpeg -y -ss ${seg.start} -i "${inputPath}" -t ${seg.end - seg.start} -c copy -avoid_negative_ts 1 "${outPath}"`
-      )
-      const pct = 45 + Math.round(((i+1)/keepSegments.length) * 25)
-      setJob(jobId, { progress: pct, phase: `Cutting segment ${i+1}/${keepSegments.length}` })
-      log(jobId, `Segment ${i+1}/${keepSegments.length}`)
+      const outSeg = path.join(segsDir, `${String(i).padStart(4,'0')}.ts`)
+      const dur = seg.end - seg.start
+      const cmd = `ffmpeg -y -ss ${seg.start} -i "${inputPath}" -t ${dur} -c copy -avoid_negative_ts 1 "${outSeg}" 2>&1`
+      await execAsync(cmd)
+      const pct = 42 + Math.round(((i + 1) / keepSegments.length) * 22)
+      setJob(jobId, { progress: pct, phase: `Cutting segment ${i + 1} of ${keepSegments.length}` })
+      log(jobId, `Segment ${i+1}/${keepSegments.length}: ${toTC(seg.start)}→${toTC(seg.end)}`)
     }
 
-    // Step 3: Concatenate
-    log(jobId, 'Concatenating...')
-    setJob(jobId, { status: 'merging', phase: 'Merging segments', progress: 72 })
+    // ── Step 5: Concat ────────────────────────────────────────────────────────
+    setJob(jobId, { status: 'merging', phase: 'Merging segments', progress: 66 })
 
     const listPath = path.join(tmpDir, 'list.txt')
     const segFiles = (await fsp.readdir(segsDir))
@@ -202,15 +304,15 @@ async function processVideo(jobId, url, cuts, muteWords, vodTitle) {
     await fsp.writeFile(listPath, segFiles)
 
     const mergedPath = path.join(tmpDir, 'merged.mp4')
-    await execAsync(`ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${mergedPath}"`)
+    await execAsync(`ffmpeg -y -f concat -safe 0 -i "${listPath}" -c copy "${mergedPath}" 2>&1`)
+    log(jobId, 'Merge complete')
 
-    // Step 4: Mute words (if any)
-    let processedPath = mergedPath
+    // ── Step 6: Mute words ────────────────────────────────────────────────────
+    let workingPath = mergedPath
+
     if (muteWords && muteWords.length > 0) {
-      log(jobId, `Muting ${muteWords.length} words...`)
-      setJob(jobId, { status: 'censoring', phase: `Muting ${muteWords.length} flagged words`, progress: 82 })
+      setJob(jobId, { status: 'censoring', phase: `Muting ${muteWords.length} flagged words`, progress: 74 })
 
-      // Remap mute timestamps to output file
       const remapped = muteWords.map(w => {
         let offset = 0
         for (const c of sortedCuts) {
@@ -225,97 +327,53 @@ async function processVideo(jobId, url, cuts, muteWords, vodTitle) {
         .join(',')
 
       const mutedPath = path.join(tmpDir, 'muted.mp4')
-      await execAsync(`ffmpeg -y -i "${mergedPath}" -af "${filterChain}" -c:v copy "${mutedPath}"`)
-      processedPath = mutedPath
+      await execAsync(`ffmpeg -y -i "${mergedPath}" -af "${filterChain}" -c:v copy "${mutedPath}" 2>&1`)
+      await fsp.unlink(mergedPath).catch(() => {})
+      workingPath = mutedPath
+      log(jobId, `Muted ${muteWords.length} words`)
     }
 
-    // Step 5: Add chapter markers
-    log(jobId, 'Adding chapter markers...')
-    setJob(jobId, { status: 'finalizing', phase: 'Adding chapter markers', progress: 90 })
+    // ── Step 7: Add chapter markers ───────────────────────────────────────────
+    setJob(jobId, { status: 'finalizing', phase: 'Embedding chapter markers', progress: 88 })
+
+    const metaLines = [';FFMETADATA1', '']
+    let outputTime = 0
+    keepSegments.forEach((seg, i) => {
+      const dur = seg.end - seg.start
+      metaLines.push('[CHAPTER]', 'TIMEBASE=1/1000', `START=${Math.round(outputTime * 1000)}`, `END=${Math.round((outputTime + dur) * 1000) - 1}`, `title=Segment ${i + 1}`, '')
+      outputTime += dur
+    })
+
+    const metaPath = path.join(tmpDir, 'meta.txt')
+    await fsp.writeFile(metaPath, metaLines.join('\n'))
 
     const outputPath = path.join(tmpDir, 'output.mp4')
-    // Build basic chapter metadata from cut points
-    const chapterMeta = buildChapterMeta(keepSegments)
-    const metaPath = path.join(tmpDir, 'chapters.txt')
-    await fsp.writeFile(metaPath, chapterMeta)
-    await execAsync(`ffmpeg -y -i "${processedPath}" -i "${metaPath}" -map_metadata 1 -codec copy "${outputPath}"`)
+    await execAsync(`ffmpeg -y -i "${workingPath}" -i "${metaPath}" -map_metadata 1 -codec copy "${outputPath}" 2>&1`)
 
-    // Cleanup intermediate files
+    // Cleanup intermediates
     await fsp.unlink(inputPath).catch(() => {})
-    await fsp.rm(segsDir, { recursive: true }).catch(() => {})
-    await fsp.unlink(mergedPath).catch(() => {})
-    if (processedPath !== mergedPath) await fsp.unlink(processedPath).catch(() => {})
+    await fsp.rm(segsDir, { recursive: true, force: true }).catch(() => {})
+    await fsp.unlink(workingPath).catch(() => {})
     await fsp.unlink(metaPath).catch(() => {})
     await fsp.unlink(listPath).catch(() => {})
 
-    log(jobId, 'Done!')
+    const outSize = fs.statSync(outputPath).size
+    log(jobId, `Done! Output: ${(outSize / 1024 / 1024).toFixed(1)} MB`)
+
     setJob(jobId, {
       status: 'done',
-      phase: 'Complete',
+      phase: 'Complete ✓',
       progress: 100,
       outputPath,
       vodTitle,
+      fileSizeMB: (outSize / 1024 / 1024).toFixed(1),
     })
 
   } catch (e) {
-    // Cleanup on error
-    await fsp.rm(tmpDir, { recursive: true }).catch(() => {})
-    throw e
+    log(jobId, `Error: ${e.message}`)
+    await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {})
+    setJob(jobId, { status: 'error', error: e.message, phase: 'Failed' })
   }
 }
 
-async function downloadWithYtDlp(url, outputPath, onProgress) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '--no-playlist',
-      '--format', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-      '--merge-output-format', 'mp4',
-      '--output', outputPath,
-      '--newline',
-      url,
-    ]
-
-    const proc = spawn('yt-dlp', args)
-    proc.stdout.on('data', (data) => {
-      const line = data.toString()
-      const match = line.match(/(\d+\.?\d*)%/)
-      if (match && onProgress) onProgress(Math.round(parseFloat(match[1])))
-    })
-    proc.stderr.on('data', d => console.error('[yt-dlp]', d.toString()))
-    proc.on('close', code => {
-      if (code === 0) resolve()
-      else reject(new Error(`yt-dlp exited with code ${code}`))
-    })
-  })
-}
-
-async function getVideoDuration(inputPath) {
-  const { stdout } = await execAsync(
-    `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`
-  )
-  return parseFloat(stdout.trim())
-}
-
-function buildChapterMeta(keepSegments) {
-  const lines = [';FFMETADATA1', '']
-  let outputTime = 0
-  keepSegments.forEach((seg, i) => {
-    const dur = seg.end - seg.start
-    const startMs = Math.round(outputTime * 1000)
-    const endMs = Math.round((outputTime + dur) * 1000) - 1
-    lines.push('[CHAPTER]')
-    lines.push('TIMEBASE=1/1000')
-    lines.push(`START=${startMs}`)
-    lines.push(`END=${endMs}`)
-    lines.push(`title=Segment ${i + 1}`)
-    lines.push('')
-    outputTime += dur
-  })
-  return lines.join('\n')
-}
-
-// ── Health check ──────────────────────────────────────────────────────────
-
-app.get('/health', (_, res) => res.json({ ok: true }))
-
-app.listen(PORT, () => console.log(`VOD Trimmer worker running on port ${PORT}`))
+app.listen(PORT, () => log(null, `Worker running on port ${PORT}`))
